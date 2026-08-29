@@ -59,7 +59,6 @@ EMOJI_STAR = "<:frost_star:1541688964342349825>"
 # ---- SellAuth live stock panel ----
 SELLAUTH_SHOP_ID = 264498  # TODO: put your SellAuth shop ID here
 SELLAUTH_SHOP_URL = "https://frost-mart-official.mysellauth.com/"  # TODO: your shop's base URL (no trailing slash)
-STOCK_PANEL_CHANNEL_ID = 1541390205116743792  # TODO: channel where ;stockpanel will live
 STOCK_REFRESH_MINUTES = 5
 
 INFO_LINKS = [
