@@ -2,9 +2,10 @@ import os
 import json
 import datetime
 import io
+import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # ============================================================
 # CONFIG
@@ -48,6 +49,25 @@ EMOJI_MART = "<:frost_mart:1541689796009926676>"
 EMOJI_EXCH = "<:frost_exch:1542487530333667409>"
 EMOJI_CAUTION = "<:frost_caution:1542183320673321020>"
 EMOJI_DOT = "<:frost_dot:1542201046808404008>"
+EMOJI_ANNOUNCE = "<:frost_announce:1541688634388910110>"
+EMOJI_STOCK = "<:frost_stock:1542183452173148220>"
+EMOJI_DOLLARS = "<:frost_dollars:1542184834758352916>"
+EMOJI_LINK = "<:frost_link:1542199813700067399>"
+EMOJI_INFO = "<:frost_info:1541688560103727155>"
+EMOJI_STAR = "<:frost_star:1541688964342349825>"
+
+# ---- SellAuth live stock panel ----
+SELLAUTH_SHOP_ID = 264498  # TODO: put your SellAuth shop ID here
+SELLAUTH_SHOP_URL = "https://frost-mart-official.mysellauth.com/"  # TODO: your shop's base URL (no trailing slash)
+STOCK_PANEL_CHANNEL_ID = 1541390205116743792  # TODO: channel where ;stockpanel will live
+STOCK_REFRESH_MINUTES = 5
+
+INFO_LINKS = [
+    (EMOJI_MART, "https://discord.gg/HmJ3nXRbJr"),
+    ("<:frost_telegram:1542185600692781066>", "https://t.me/frostmartt"),
+    ("<:frost_website:1542200495949615204>", "https://frostmart.netlify.app"),
+]
+FROST_OWNER_IDS = [1541264737562533958, 1525240197627777074]
 
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data", "store.json")
 
@@ -70,6 +90,8 @@ def load_data():
             "rates": {"i2c": 104, "c2i": 101},
             "panel_channel_id": None,
             "panel_message_id": None,
+            "stock_channel_id": None,
+            "stock_message_id": None,
         }
     with open(DATA_FILE, "r") as f:
         return json.load(f)
@@ -258,6 +280,115 @@ class CloseTicketView(discord.ui.View):
 
 
 # ============================================================
+# SELLAUTH LIVE STOCK PANEL
+# ============================================================
+async def fetch_sellauth_products():
+    """Fetches all products from the SellAuth API."""
+    api_key = os.getenv("SELLAUTH_API_KEY")
+    if not api_key:
+        print("SELLAUTH_API_KEY environment variable is not set — skipping stock refresh.")
+        return None
+
+    url = f"https://api.sellauth.com/v1/shops/{SELLAUTH_SHOP_ID}/products"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                print(f"SellAuth API error {resp.status}: {await resp.text()}")
+                return None
+            data = await resp.json()
+            # Some endpoints paginate under a "data" key — handle both shapes.
+            return data.get("data", data) if isinstance(data, dict) else data
+
+
+def build_stock_embeds(products) -> list[discord.Embed]:
+    header = discord.Embed(
+        description=f"{EMOJI_MART} **__Sellauth Live Panel__** {EMOJI_ANNOUNCE}",
+        color=discord.Color.dark_theme(),
+    )
+
+    products_embed = discord.Embed(color=discord.Color.dark_theme())
+    for product in products[:25]:  # Discord allows max 25 fields per embed
+        name = product.get("name", "Unknown")
+        stock = product.get("stock_count")
+        stock_text = "Out of stock" if not stock else str(stock)
+        price = product.get("price", "?")
+        currency = product.get("currency", "USD")
+        path = product.get("path", "")
+        link = f"{SELLAUTH_SHOP_URL}/product/{path}"
+
+        value = (
+            f"{EMOJI_STOCK} Stock: **{stock_text}**\n"
+            f"{EMOJI_DOLLARS} Price: **{price} {currency}**\n"
+            f"{EMOJI_LINK} Link: [Buy Here]({link})"
+        )
+        products_embed.add_field(name=f"{EMOJI_DOT} {name}", value=value, inline=True)
+
+    info_lines = "\n".join(f"{emoji} {link}" for emoji, link in INFO_LINKS)
+    owners = " ".join(f"<@{uid}>" for uid in FROST_OWNER_IDS)
+    info_embed = discord.Embed(
+        description=(
+            f"-# This message updates automatically.\n\n"
+            f"{EMOJI_INFO} **__Information__** {EMOJI_STAR}\n\n"
+            f"{info_lines}\n\n"
+            f"**__Frost Owners__** {EMOJI_MART}\n\n"
+            f"{owners}"
+        ),
+        color=discord.Color.dark_theme(),
+    )
+
+    return [header, products_embed, info_embed]
+
+
+async def refresh_stock_panel():
+    channel_id = store.get("stock_channel_id")
+    message_id = store.get("stock_message_id")
+    if not channel_id or not message_id:
+        return
+
+    products = await fetch_sellauth_products()
+    if products is None:
+        return  # keep showing last successful data rather than wiping it
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(message_id)
+        await message.edit(embeds=build_stock_embeds(products))
+    except discord.NotFound:
+        pass
+
+
+@tasks.loop(minutes=STOCK_REFRESH_MINUTES)
+async def stock_refresh_loop():
+    await refresh_stock_panel()
+
+
+@bot.command(name="stockpanel")
+@commands.has_permissions(administrator=True)
+async def stockpanel_command(ctx: commands.Context):
+    """Sends the live SellAuth stock panel in this channel."""
+    products = await fetch_sellauth_products()
+    embeds = build_stock_embeds(products or [])
+    message = await ctx.send(embeds=embeds)
+    store["stock_channel_id"] = message.channel.id
+    store["stock_message_id"] = message.id
+    save_data(store)
+    await ctx.message.delete()
+
+    if not stock_refresh_loop.is_running():
+        stock_refresh_loop.start()
+
+
+@stockpanel_command.error
+async def stockpanel_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("Only admins can use this command.", delete_after=5)
+
+
+# ============================================================
 # ;setup COMMAND
 # ============================================================
 @bot.command(name="setup")
@@ -402,6 +533,11 @@ async def on_ready():
     bot.add_view(TicketPanelView())
     bot.add_view(CloseTicketView("i2c"))
     bot.add_view(CloseTicketView("c2i"))
+
+    if store.get("stock_channel_id") and store.get("stock_message_id"):
+        if not stock_refresh_loop.is_running():
+            stock_refresh_loop.start()
+
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s).")
