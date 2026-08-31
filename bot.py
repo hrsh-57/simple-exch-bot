@@ -10,9 +10,13 @@ from discord.ext import commands, tasks
 # ============================================================
 # CONFIG
 # ============================================================
-COMMAND_PREFIX = ";"
+COMMAND_PREFIX = "*"
 
 SUPPORT_ROLE_ID = 1542484433402069003
+
+# ---- Credit & Deliver system ----
+ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "Admin")
+CREDIT_TO_KEYS = 2  # 1 credit = this many stock items
 
 CATEGORY_CONFIG = {
     "i2c": {
@@ -57,8 +61,8 @@ EMOJI_INFO = "<:frost_info:1541688560103727155>"
 EMOJI_STAR = "<:frost_star:1541688964342349825>"
 
 # ---- SellAuth live stock panel ----
-SELLAUTH_SHOP_ID = 264498  # TODO: put your SellAuth shop ID here
-SELLAUTH_SHOP_URL = "https://frost-mart-official.mysellauth.com/"  # TODO: your shop's base URL (no trailing slash)
+SELLAUTH_SHOP_ID = 0  # TODO: put your SellAuth shop ID here
+SELLAUTH_SHOP_URL = "https://your-shop.mysellauth.com"  # TODO: your shop's base URL (no trailing slash)
 STOCK_REFRESH_MINUTES = 5
 
 INFO_LINKS = [
@@ -91,9 +95,14 @@ def load_data():
             "panel_message_id": None,
             "stock_channel_id": None,
             "stock_message_id": None,
+            "credits": {},
+            "stock": {},
         }
     with open(DATA_FILE, "r") as f:
-        return json.load(f)
+        data = json.load(f)
+    data.setdefault("credits", {})
+    data.setdefault("stock", {})
+    return data
 
 
 def save_data(data):
@@ -310,16 +319,26 @@ def build_stock_embeds(products) -> list[discord.Embed]:
     products_embed = discord.Embed(color=discord.Color.dark_theme())
     for product in products[:25]:  # Discord allows max 25 fields per embed
         name = product.get("name", "Unknown")
-        stock = product.get("stock_count")
-        stock_text = "Out of stock" if not stock else str(stock)
-        price = product.get("price", "?")
+
+        price = product.get("price")
         currency = product.get("currency", "USD")
+        stock = product.get("stock_count")
+
+        # Variant-type products keep price/stock on each variant instead of the product itself.
+        variants = product.get("variants") or []
+        if price is None and variants:
+            first_variant = variants[0]
+            price = first_variant.get("price")
+            stock = first_variant.get("stock_count", stock)
+
+        price_text = price if price is not None else "N/A"
+        stock_text = "Out of stock" if not stock else str(stock)
         path = product.get("path", "")
         link = f"{SELLAUTH_SHOP_URL}/product/{path}"
 
         value = (
             f"{EMOJI_STOCK} Stock: **{stock_text}**\n"
-            f"{EMOJI_DOLLARS} Price: **{price} {currency}**\n"
+            f"{EMOJI_DOLLARS} Price: **{price_text} {currency}**\n"
             f"{EMOJI_LINK} Link: [Buy Here]({link})"
         )
         products_embed.add_field(name=f"{EMOJI_DOT} {name}", value=value, inline=True)
@@ -441,7 +460,7 @@ class CalculatorView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("This calculator isn't yours — run `;cal` to get your own.", ephemeral=True)
+            await interaction.response.send_message("This calculator isn't yours — run `*cal` to get your own.", ephemeral=True)
             return False
         return True
 
@@ -522,6 +541,203 @@ async def calculator_command(ctx: commands.Context):
     """Opens the interactive rate calculator."""
     view = CalculatorView(ctx.author.id)
     await ctx.send(embed=view.build_embed(), view=view)
+
+
+# ============================================================
+# CREDIT & DELIVER SYSTEM
+# ============================================================
+def is_admin(user: discord.Member) -> bool:
+    if user.guild_permissions.administrator:
+        return True
+    return any(role.name == ADMIN_ROLE_NAME for role in user.roles)
+
+
+def get_credits(user_id: int) -> int:
+    return store["credits"].get(str(user_id), 0)
+
+
+def set_credits(user_id: int, amount: int):
+    store["credits"][str(user_id)] = max(0, amount)
+    save_data(store)
+
+
+class AddStockModal(discord.ui.Modal, title="Add Stock"):
+    keys_input = discord.ui.TextInput(
+        label="One key per line",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        placeholder="key-one\nkey-two\nkey-three",
+    )
+
+    def __init__(self, product_name: str):
+        super().__init__()
+        self.product_name = product_name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        lines = [line.strip() for line in self.keys_input.value.splitlines() if line.strip()]
+        if not lines:
+            await interaction.response.send_message("❌ No valid lines found — nothing was added.", ephemeral=True)
+            return
+
+        store["stock"].setdefault(self.product_name, []).extend(lines)
+        save_data(store)
+        await interaction.response.send_message(
+            f"✅ Added **{len(lines)}** key(s) to **{self.product_name}**. "
+            f"New stock count: **{len(store['stock'][self.product_name])}**.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="createproduct", description="Create a new product (admin only)")
+@app_commands.describe(name="Name of the product")
+async def createproduct(interaction: discord.Interaction, name: str):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ You don't have permission to do that.", ephemeral=True)
+        return
+
+    if name in store["stock"]:
+        await interaction.response.send_message(f"❌ Product **{name}** already exists.", ephemeral=True)
+        return
+
+    store["stock"][name] = []
+    save_data(store)
+    await interaction.response.send_message(f"✅ Product **{name}** created with 0 stock.", ephemeral=True)
+
+
+@bot.tree.command(name="addstock", description="Add stock to a product (admin only)")
+@app_commands.describe(product="Name of the product")
+async def addstock(interaction: discord.Interaction, product: str):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ You don't have permission to do that.", ephemeral=True)
+        return
+
+    if product not in store["stock"]:
+        await interaction.response.send_message(f"❌ Product **{product}** doesn't exist. Create it first with `/createproduct`.", ephemeral=True)
+        return
+
+    await interaction.response.send_modal(AddStockModal(product))
+
+
+@bot.tree.command(name="removestock", description="Remove one key from a product's stock (admin only)")
+@app_commands.describe(product="Name of the product", key="The exact key to remove")
+async def removestock(interaction: discord.Interaction, product: str, key: str):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ You don't have permission to do that.", ephemeral=True)
+        return
+
+    if product not in store["stock"]:
+        await interaction.response.send_message(f"❌ Product **{product}** doesn't exist.", ephemeral=True)
+        return
+
+    if key not in store["stock"][product]:
+        await interaction.response.send_message(f"❌ That key wasn't found in **{product}**.", ephemeral=True)
+        return
+
+    store["stock"][product].remove(key)
+    save_data(store)
+    await interaction.response.send_message(f"✅ Removed key from **{product}**. Remaining stock: **{len(store['stock'][product])}**.", ephemeral=True)
+
+
+@bot.tree.command(name="addcredits", description="Add credits to a user (admin only)")
+@app_commands.describe(user="The user to credit", amount="How many credits to add")
+async def addcredits(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ You don't have permission to do that.", ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+        return
+
+    set_credits(user.id, get_credits(user.id) + amount)
+    await interaction.response.send_message(f"✅ Added **{amount}** credit(s) to {user.mention}. New balance: **{get_credits(user.id)}**.", ephemeral=True)
+
+
+@bot.tree.command(name="removecredits", description="Remove credits from a user (admin only)")
+@app_commands.describe(user="The user to deduct from", amount="How many credits to remove")
+async def removecredits(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ You don't have permission to do that.", ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+        return
+
+    set_credits(user.id, get_credits(user.id) - amount)
+    await interaction.response.send_message(f"✅ Removed **{amount}** credit(s) from {user.mention}. New balance: **{get_credits(user.id)}**.", ephemeral=True)
+
+
+@bot.tree.command(name="balance", description="Check your credit balance")
+async def balance(interaction: discord.Interaction):
+    await interaction.response.send_message(f"💳 You have **{get_credits(interaction.user.id)}** credit(s).", ephemeral=True)
+
+
+@bot.tree.command(name="stock", description="View all products and their stock counts")
+async def stock(interaction: discord.Interaction):
+    if not store["stock"]:
+        await interaction.response.send_message("There are no products yet.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="📦 Product Stock", color=discord.Color.blurple())
+    for product, keys in store["stock"].items():
+        embed.add_field(name=product, value=f"**{len(keys)}** in stock", inline=True)
+    embed.set_footer(text=f"1 credit = {CREDIT_TO_KEYS} item(s)")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="redeem", description="Spend credits to redeem items from a product")
+@app_commands.describe(product="Name of the product", credits="How many credits to spend")
+async def redeem(interaction: discord.Interaction, product: str, credits: int):
+    if credits <= 0:
+        await interaction.response.send_message("❌ Credits must be a positive number.", ephemeral=True)
+        return
+
+    if product not in store["stock"]:
+        await interaction.response.send_message(f"❌ Product **{product}** doesn't exist.", ephemeral=True)
+        return
+
+    user_balance = get_credits(interaction.user.id)
+    if user_balance < credits:
+        await interaction.response.send_message(
+            f"❌ You don't have enough credits. Balance: **{user_balance}**, needed: **{credits}**.", ephemeral=True
+        )
+        return
+
+    items_needed = credits * CREDIT_TO_KEYS
+    available = store["stock"][product]
+    if len(available) < items_needed:
+        await interaction.response.send_message(
+            f"❌ Not enough stock for **{product}**. Available: **{len(available)}**, needed: **{items_needed}**.",
+            ephemeral=True,
+        )
+        return
+
+    # Deduct up front
+    delivered = available[:items_needed]
+    store["stock"][product] = available[items_needed:]
+    set_credits(interaction.user.id, user_balance - credits)
+    save_data(store)
+
+    keys_block = "\n".join(delivered)
+    dm_content = f"✅ Here are your **{product}** keys ({items_needed} item(s)):\n```\n{keys_block}\n```"
+
+    try:
+        await interaction.user.send(dm_content)
+    except discord.Forbidden:
+        # Refund everything since delivery failed
+        store["stock"][product] = delivered + store["stock"][product]
+        set_credits(interaction.user.id, user_balance)
+        save_data(store)
+        await interaction.response.send_message(
+            "❌ I couldn't DM you (your DMs might be closed). Your credits and stock have been refunded — "
+            "please open your DMs and try `/redeem` again.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ Redeemed **{items_needed}** item(s) from **{product}** for **{credits}** credit(s). Check your DMs!",
+        ephemeral=True,
+    )
 
 
 # ============================================================
